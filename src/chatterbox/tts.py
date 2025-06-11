@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Union, List
 
 import librosa
 import torch
@@ -210,7 +211,7 @@ class ChatterboxTTS:
 
     def generate(
         self,
-        text,
+        text: Union[str, List[str]],
         repetition_penalty=1.2,
         min_p=0.05,
         top_p=1.0,
@@ -218,6 +219,7 @@ class ChatterboxTTS:
         exaggeration=0.5,
         cfg_weight=0.5,
         temperature=0.8,
+        use_analyzer=False,
     ):
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
@@ -233,43 +235,66 @@ class ChatterboxTTS:
                 emotion_adv=exaggeration * torch.ones(1, 1, 1),
             ).to(device=self.device)
 
-        # Norm and tokenize text
-        text = punc_norm(text)
-        text_tokens = self.tokenizer.text_to_tokens(text).to(self.device)
+        if isinstance(text, str):
+            texts = [text]
+        else:
+            texts = text
+        batch_size = len(texts)
 
-        if cfg_weight > 0.0:
-            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # Need two seqs for CFG
+        # Norm and tokenize each text
+        texts = [punc_norm(t) for t in texts]
+        token_ids_list = [self.tokenizer.text_to_tokens(t).squeeze(0) for t in texts]
+
+        # Get true lengths before padding
+        text_lens = torch.tensor([len(t) for t in token_ids_list], device=self.device)
+
+        # Pad all sequences to the max length in the batch
+        max_len = text_lens.max().item()
+        # Use EOT as the pad token
+        pad_token_id = self.t3.hp.stop_text_token
+        text_tokens = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=self.device)
+        for i, tokens in enumerate(token_ids_list):
+            text_tokens[i, :len(tokens)] = tokens
 
         sot = self.t3.hp.start_text_token
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        text_lens += 2 # Account for SOT/EOT tokens
 
+        if cfg_weight > 0.0:
+            text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+            # DO NOT duplicate text_lens. `t3.inference` uses the original length to
+            # determine the actual batch size, and its internal logic handles CFG.
+   
         with torch.inference_mode():
-            speech_tokens = self.t3.inference(
+            speech_tokens_batch = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
+                text_token_lens=text_lens,
                 max_new_tokens=1000,  # TODO: use the value in config
                 temperature=temperature,
                 cfg_weight=cfg_weight,
                 repetition_penalty=repetition_penalty,
                 min_p=min_p,
                 top_p=top_p,
+                use_analyzer=use_analyzer,
             )
-            # Extract only the conditional batch.
-            speech_tokens = speech_tokens[0]
 
-            # TODO: output becomes 1D
-            speech_tokens = drop_invalid_tokens(speech_tokens)
+            wavs = []
+            for speech_tokens in speech_tokens_batch:
+                speech_tokens = drop_invalid_tokens(speech_tokens)
             
-            speech_tokens = speech_tokens[speech_tokens < 6561]
+                speech_tokens = speech_tokens[speech_tokens < 6561]
 
-            speech_tokens = speech_tokens.to(self.device)
+                speech_tokens = speech_tokens.to(self.device)
 
-            wav, _ = self.s3gen.inference(
-                speech_tokens=speech_tokens,
-                ref_dict=self.conds.gen,
-            )
-            wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+                wav, _ = self.s3gen.inference(
+                    speech_tokens=speech_tokens,
+                    ref_dict=self.conds.gen,
+                )
+                wav = wav.squeeze(0).detach().cpu().numpy()
+                watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+                wavs.append(torch.from_numpy(watermarked_wav).unsqueeze(0))
+
+        return wavs if len(wavs) > 1 else wavs[0] # Return list or single item

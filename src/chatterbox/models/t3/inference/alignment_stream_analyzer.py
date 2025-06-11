@@ -4,7 +4,7 @@
 import logging
 import torch
 from dataclasses import dataclass
-from types import MethodType
+from typing import Optional
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ class AlignmentAnalysisResult:
 
 
 class AlignmentStreamAnalyzer:
-    def __init__(self, queue, text_tokens_slice, eos_idx=0):
+    def __init__(self, queue, text_tokens_slice, eos_idx=0, text_len: Optional[int] = None):
         """
         Some transformer TTS models implicitly solve text-speech alignment in one or more of their self-attention
         activation maps. This module exploits this to perform online integrity checks which streaming.
@@ -38,6 +38,7 @@ class AlignmentStreamAnalyzer:
         """
         # self.queue = queue
         self.text_tokens_slice = (i, j) = text_tokens_slice
+        self.text_len = text_len if text_len is not None else (j - i)
         self.eos_idx = eos_idx
         self.alignment = torch.zeros(0, j-i)
         # self.alignment_bin = torch.zeros(0, j-i)
@@ -54,14 +55,9 @@ class AlignmentStreamAnalyzer:
         """
         Emits an AlignmentAnalysisResult into the output queue, and potentially modifies the logits to force an EOS.
         """
-        # extract approximate alignment matrix chunk (1 frame at a time after the first chunk)
+        # extract approximate alignment matrix chunk (1 frame at a time)
         i, j = self.text_tokens_slice
-        if self.curr_frame_pos == 0:
-            # first chunk has conditioning info, text tokens, and BOS token
-            A_chunk = last_aligned_attn[j:, i:j].clone().cpu() # (T, S)
-        else:
-            # subsequent chunks have 1 frame due to KV-caching
-            A_chunk = last_aligned_attn[:, i:j].clone().cpu() # (1, S)
+        A_chunk = last_aligned_attn[-1:, i:j].clone().cpu()
 
         # TODO: monotonic masking; could have issue b/c spaces are often skipped.
         A_chunk[:, self.curr_frame_pos + 1:] = 0
@@ -81,13 +77,20 @@ class AlignmentStreamAnalyzer:
         # Hallucinations at the start of speech show up as activations at the bottom of the attention maps!
         # To mitigate this, we just wait until there are no activations far off-diagonal in the last 2 tokens,
         # and there are some strong activations in the first few tokens.
-        false_start = (not self.started) and (A[-2:, -2:].max() > 0.1 or A[:, :4].max() < 0.5)
+        false_start = not self.started
+        if T >= 2: # Wait for 2 frames before checking.
+            is_unstable = A[-2:, -2:].max() > 0.1 or A[:, :4].max() < 0.5
+            false_start = false_start and is_unstable
+        else:
+            # During the grace period, always assume it's a false start.
+            false_start = True
+
         self.started = not false_start
         if self.started and self.started_at is None:
             self.started_at = T
 
         # Is generation likely complete?
-        self.complete = self.complete or self.text_position >= S - 3
+        self.complete = self.complete or self.text_position >= 3
         if self.complete and self.completed_at is None:
             self.completed_at = T
 
@@ -110,7 +113,7 @@ class AlignmentStreamAnalyzer:
             logits[..., self.eos_idx] = 2**15
 
         # Suppress EoS to prevent early termination
-        if cur_text_posn < S - 3: # FIXME: arbitrary
+        if cur_text_posn < self.text_len - 3:
             logits[..., self.eos_idx] = -2**15
 
         self.curr_frame_pos += 1
