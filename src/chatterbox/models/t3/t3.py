@@ -14,8 +14,10 @@ from .modules.learned_pos_emb import LearnedPositionEmbeddings
 
 from .modules.cond_enc import T3CondEnc, T3Cond
 from .modules.t3_config import T3Config
+from .llama_model import ModifiedLlamaModel
 from .llama_configs import LLAMA_CONFIGS
 from .inference.t3_hf_backend import T3HuggingfaceBackend
+from .inference.alignment_stream_analyzer import AlignmentStreamAnalyzer
 from ..utils import AttrDict
 
 
@@ -42,7 +44,7 @@ class T3(nn.Module):
         super().__init__()
         self.hp = hp
         self.cfg = LlamaConfig(**LLAMA_CONFIGS[hp.llama_config_name])
-        self.tfmr = LlamaModel(self.cfg)
+        self.tfmr = ModifiedLlamaModel(self.cfg)
         self.dim = self.cfg.hidden_size
         self.deepspeed_patch_applied = False
 
@@ -252,13 +254,19 @@ class T3(nn.Module):
         # TODO? synchronize the expensive compile function
         # with self.compile_lock:
         if not self.compiled:
+            analyzer = AlignmentStreamAnalyzer(
+                None,
+                text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+                eos_idx=self.hp.stop_speech_token
+            )
             patched_model = T3HuggingfaceBackend(
                 config=self.cfg,
                 llama=self.tfmr,
                 speech_enc=self.speech_emb,
                 speech_head=self.speech_head,
-                alignment_stream_analyzer=None,
+                alignment_layer_idx=9, # TODO: hparam or something?
             )
+            self.analyzer = analyzer
             self.patched_model = patched_model
             self.compiled = True
 
@@ -319,6 +327,15 @@ class T3(nn.Module):
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
             logits = output.logits[:, -1, :]
 
+            # 1. Extract the attention map from the model's explicit output.
+            # `output.attentions` is a tuple. Since we only requested one layer, it has one element.
+            last_attention_map = output.attentions[0]
+            # 2. The map is (B, H, T, T). We need the map for batch item 0 (the conditional batch)
+            # and average over the heads. This matches the old hook logic.
+            last_attention_map_for_analyzer = last_attention_map[0].mean(0)
+            # 3. Pass the logits AND the corresponding attention map to the analyzer.
+            logits = self.analyzer.step(logits, last_attention_map_for_analyzer)
+
             # CFG
             if cfg_weight > 0.0:
                 logits_cond = logits[0:1]
@@ -359,7 +376,6 @@ class T3(nn.Module):
             output = self.patched_model(
                 inputs_embeds=next_token_embed,
                 past_key_values=past,
-                output_attentions=True,
                 output_hidden_states=True,
                 return_dict=True,
             )
