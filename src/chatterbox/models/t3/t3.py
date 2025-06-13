@@ -320,6 +320,8 @@ class T3(nn.Module):
         # We start with the BOS token because it's part of the sequence history now.
         generated_ids = bos_tokens.clone()
         is_finished = torch.zeros(B_actual, dtype=torch.bool, device=device)
+        replace_n_tokens_map = {} # For the analyzer's replace-with-silence action
+        error_flags = [None] * B_actual # For the analyzer's error action
 
         # Instantiate the logits processors.
         min_p_warper = MinPLogitsWarper(min_p=min_p)
@@ -344,6 +346,7 @@ class T3(nn.Module):
         for i in tqdm(range(max_new_tokens), desc="Sampling", dynamic_ncols=True):
             logits = output.logits[:, -1, :]
 
+            analyzer_actions = [None] * B_full
             if use_analyzer:
                 last_attention_map = output.attentions[0]
                 for j in range(B_actual):
@@ -351,8 +354,8 @@ class T3(nn.Module):
                     if is_finished[j]:
                         continue
                     # The map is (H, T_q, T_kv), we average over heads.
-                    attn_map_for_analyzer = last_attention_map[j].mean(0)
-                    logits[j:j+1] = self.analyzers[j].step(logits[j:j+1], attn_map_for_analyzer)
+                    attn_map_for_analyzer = last_attention_map[j] # Shape: (num_heads, 1, T_kv)
+                    analyzer_actions[j] = self.analyzers[j].step(logits[j:j+1], attn_map_for_analyzer)
 
             # CFG
             if cfg_weight > 0.0:
@@ -360,6 +363,20 @@ class T3(nn.Module):
                 logits_cfg = logits_cond + cfg_weight * (logits_cond - logits_uncond)
             else:
                 logits_cfg = logits
+
+            if use_analyzer:
+                # Suppress EOS token if analyzer requested it.
+                suppress_rows = [j for j in range(B_actual) if analyzer_actions[j] and analyzer_actions[j].suppress_eos]
+                if suppress_rows:
+                    logits_cfg[suppress_rows, self.hp.stop_speech_token] = -torch.inf
+                
+                # Additive boost for silence token if analyzer requested it.
+                boost_rows = [j for j in range(B_actual) if analyzer_actions[j] and analyzer_actions[j].boost_silence]
+                if boost_rows:
+                    silence_token_id = AlignmentStreamAnalyzer.SILENCE_TOKEN_ID
+                    boost_value = AlignmentStreamAnalyzer.SILENCE_BOOST_LOGIT_VALUE
+                    logits_cfg[boost_rows, silence_token_id] += boost_value
+
 
             # Apply temperature scaling.
             if temperature != 1.0:
@@ -374,7 +391,19 @@ class T3(nn.Module):
             probs = torch.softmax(logits_processed, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)  # (B_actual, 1)
 
-            # Append the *newly sampled* token to the history for the *next* repetition penalty check.
+            if use_analyzer:
+                # Analyzer intervention: Overwrite sampled token if EOS is forced or replacement is requested
+                for j in range(B_actual):
+                    action = analyzer_actions[j]
+                    if action:
+                        if action.error:
+                            error_flags[j] = True
+                        if action.replace_last_n_with_silence is not None:
+                            replace_n_tokens_map[j] = action.replace_last_n_with_silence
+                        if action.emit_eos and not is_finished[j]:
+                            next_token[j] = self.hp.stop_speech_token
+
+            # Append the *final chosen* token to the history for the *next* repetition penalty check.
             generated_ids = torch.cat([generated_ids, next_token], dim=1)
             
             # Update finished state
@@ -386,7 +415,7 @@ class T3(nn.Module):
             # Get embedding for the new token.
             next_token_embed = self.speech_emb(next_token) + self.speech_pos_emb.get_fixed_embedding(i + 1)
 
-            #  For CFG
+            # For CFG
             if cfg_weight > 0.0:
                 next_token_embed = torch.cat([next_token_embed, next_token_embed], dim=0)
 
@@ -402,6 +431,11 @@ class T3(nn.Module):
             # Update the kv_cache.
             past = output.past_key_values
 
+        if use_analyzer:
+            # Print debug logs for each analyzer
+            for j in range(B_actual):
+                if self.analyzers[j].debug_log:
+                    self.analyzers[j].debug_log.print_report()
 
         # Format Output
         output_list = []
@@ -413,6 +447,14 @@ class T3(nn.Module):
             if len(eos_indices) > 0:
                 # Truncate the sequence at the first EOS token
                 seq = seq[:eos_indices[0]]
+            if use_analyzer:
+                # Replace the last n tokens with silence if specified by the analyzer
+                if i in replace_n_tokens_map:
+                    n = replace_n_tokens_map[i]
+                    if n > 0 and len(seq) > 0:
+                        # Replace the last n tokens with the silence token.
+                        seq[-n:] = AlignmentStreamAnalyzer.SILENCE_TOKEN_ID
+
             output_list.append(seq)
 
-        return output_list
+        return output_list, error_flags

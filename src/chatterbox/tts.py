@@ -220,6 +220,7 @@ class ChatterboxTTS:
         cfg_weight=0.5,
         temperature=0.8,
         use_analyzer=False,
+        skip_error_check=False,
     ):
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
@@ -268,7 +269,7 @@ class ChatterboxTTS:
             # determine the actual batch size, and its internal logic handles CFG.
    
         with torch.inference_mode():
-            speech_tokens_batch = self.t3.inference(
+            speech_tokens_batch, error_flags = self.t3.inference(
                 t3_cond=self.conds.t3,
                 text_tokens=text_tokens,
                 text_token_lens=text_lens,
@@ -282,7 +283,11 @@ class ChatterboxTTS:
             )
 
             wavs = []
-            for speech_tokens in speech_tokens_batch:
+            for speech_tokens, error_flag in zip(speech_tokens_batch, error_flags):
+                if not skip_error_check and error_flag:
+                    wavs.append(None) # Append None for error cases
+                    continue
+
                 speech_tokens = drop_invalid_tokens(speech_tokens)
             
                 speech_tokens = speech_tokens[speech_tokens < 6561]
