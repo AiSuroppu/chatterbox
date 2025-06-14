@@ -1,6 +1,7 @@
-from dataclasses import dataclass
+# src/chatterbox/tts.py
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Union, List
+from typing import Union, List, Optional
 
 import librosa
 import torch
@@ -183,8 +184,19 @@ class ChatterboxTTS:
 
         return cls.from_local(Path(local_path).parent, device, compile_mode=compile_mode)
 
-    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
-        ## Load reference wav
+    def create_voice_embedding(self, wav_fpath: str, exaggeration: float = 0.5) -> Conditionals:
+        """
+        Creates a voice embedding object from a given audio file. This object can be
+        cached and reused in subsequent calls to `generate` for efficiency.
+
+        Args:
+            wav_fpath (str): Path to the audio file to use as a voice reference.
+            exaggeration (float, optional): Controls the emotional exaggeration of the voice. Defaults to 0.5.
+
+        Returns:
+            Conditionals: An object containing the necessary conditioning information for TTS.
+        """
+        # Load reference wav
         s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
 
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
@@ -207,7 +219,17 @@ class ChatterboxTTS:
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=self.device)
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+
+        return Conditionals(t3_cond, s3gen_ref_dict)
+
+    def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
+        """
+        [DEPRECATED] Prepares and sets an internal voice embedding from an audio file.
+        Prefer using `create_voice_embedding` and passing the result to `generate`
+        via the `voice_embedding_cache` argument for better performance.
+        This method is maintained for backward compatibility.
+        """
+        self.conds = self.create_voice_embedding(wav_fpath, exaggeration)
 
     def generate(
         self,
@@ -221,20 +243,36 @@ class ChatterboxTTS:
         temperature=0.8,
         use_analyzer=False,
         skip_error_check=False,
+        voice_embedding_cache=None,
     ):
-        if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-        else:
-            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+        # Determine which conditionals to use, ensuring valid arguments.
+        if voice_embedding_cache is not None and audio_prompt_path is not None:
+            raise ValueError("Cannot provide both `voice_embedding_cache` and `audio_prompt_path`. Please use one.")
 
-        # Update exaggeration if needed
-        if exaggeration != self.conds.t3.emotion_adv[0, 0, 0]:
-            _cond: T3Cond = self.conds.t3
-            self.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=self.device)
+        if voice_embedding_cache is not None:
+            active_conds = voice_embedding_cache
+        elif audio_prompt_path is not None:
+            # For backward compatibility, create and set the internal cache.
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            active_conds = self.conds
+        else:
+            # Use the internal cache if it exists (e.g., from a built-in voice or previous call).
+            active_conds = self.conds
+
+        if active_conds is None:
+            raise ValueError(
+                "No voice conditioning provided. Please set `voice_embedding_cache` or `audio_prompt_path`."
+            )
+        active_conds = active_conds.to(self.device)
+
+        # Handle exaggeration: If the user provides a different exaggeration value,
+        # create a new T3Cond for this generation call without modifying the original cache object.
+        t3_cond_for_inference = active_conds.t3
+        if exaggeration != t3_cond_for_inference.emotion_adv[0, 0, 0]:
+            t3_cond_for_inference = replace(
+                t3_cond_for_inference,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1)
+            )
 
         if isinstance(text, str):
             texts = [text]
@@ -270,7 +308,7 @@ class ChatterboxTTS:
    
         with torch.inference_mode():
             speech_tokens_batch, error_flags = self.t3.inference(
-                t3_cond=self.conds.t3,
+                t3_cond=t3_cond_for_inference,
                 text_tokens=text_tokens,
                 text_token_lens=text_lens,
                 max_new_tokens=1000,  # TODO: use the value in config
@@ -296,7 +334,7 @@ class ChatterboxTTS:
 
                 wav, _ = self.s3gen.inference(
                     speech_tokens=speech_tokens,
-                    ref_dict=self.conds.gen,
+                    ref_dict=active_conds.gen,
                 )
                 wav = wav.squeeze(0).detach().cpu().numpy()
                 watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
