@@ -78,6 +78,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         output_attentions=False,
         output_hidden_states=True,
         return_dict=True,
+        request_alignment_attentions=False,
     ):
         """
         This is a method used by huggingface's generate() method.
@@ -93,7 +94,7 @@ class T3HuggingfaceBackend(LlamaPreTrainedModel, GenerationMixin):
         assert output_hidden_states
 
         # We want attentions from this specific layer to power the analyzer
-        output_attentions_layer_indices = [self.alignment_layer_idx]
+        output_attentions_layer_indices = [self.alignment_layer_idx] if request_alignment_attentions else None
 
         tfmr_out = self.model(
             inputs_embeds=inputs_embeds,

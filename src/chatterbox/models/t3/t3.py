@@ -336,6 +336,7 @@ class T3(nn.Module):
             past_key_values=None,
             use_cache=True,
             output_attentions=False, # Set to False for efficiency, as our custom model fetches only the required alignment layer's attention.
+            request_alignment_attentions=use_analyzer,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -425,6 +426,7 @@ class T3(nn.Module):
                 past_key_values=past,
                 use_cache=True,
                 output_attentions=False, # Set to False for efficiency, as our custom model fetches only the required alignment layer's attention.
+                request_alignment_attentions=use_analyzer,
                 output_hidden_states=True,
                 return_dict=True,
             )
