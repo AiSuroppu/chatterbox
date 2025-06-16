@@ -125,7 +125,7 @@ class ChatterboxTTS:
         self.s3gen = s3gen
         self.ve = ve
         self.tokenizer = tokenizer
-        self.device = device
+        self.device = torch.device(device)
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
 
@@ -243,9 +243,34 @@ class ChatterboxTTS:
         use_analyzer=False,
         skip_error_check=False,
         voice_embedding_cache=None,
+        offload_s3gen=False,
+        offload_t3=False,
         batch_size=1,
     ):
+        """
+        Generates audio from text.
 
+        Args:
+            text (Union[str, List[str]]): The text or a batch of texts to be synthesized.
+            repetition_penalty (float): Penalty for repeating tokens.
+            min_p (float): Minimum probability for nucleus sampling.
+            top_p (float): Cumulative probability for nucleus sampling.
+            audio_prompt_path (str, optional): Path to an audio file to use as a voice reference.
+            exaggeration (float): Controls the intensity of the emotion.
+            cfg_weight (float): Classifier-Free Guidance weight.
+            temperature (float): Sampling temperature.
+            use_analyzer (bool): Whether to use the alignment stream analyzer.
+            skip_error_check (bool): If True and use_analyzer is True, ignores errors from the
+                alignment stream analyzer and attempts to generate audio anyway.
+            voice_embedding_cache (Conditionals, optional): A pre-computed voice embedding object.
+                Using this is more efficient than `audio_prompt_path` for multiple generations with the same voice.
+            offload_s3gen (bool): If True, offloads the s3gen model to the CPU
+                during T3 inference to save VRAM, allowing for larger batch sizes.
+                This adds a small time overhead for model transfer.
+            offload_t3 (bool): If True, offloads the T3 model to CPU after its inference
+                to free up VRAM for s3gen.
+            batch_size (int): The number of texts to process in a single batch.
+        """
         # Determine which conditionals to use, ensuring valid arguments.
         if voice_embedding_cache is not None and audio_prompt_path is not None:
             raise ValueError("Cannot provide both `voice_embedding_cache` and `audio_prompt_path`. Please use one.")
@@ -289,6 +314,17 @@ class ChatterboxTTS:
 
         tokenized_items.sort(key=lambda x: x['length'], reverse=True)
 
+        # Offload s3gen to CPU once before T3 inference loop
+        if offload_s3gen and self.device.type != 'cpu':
+            self.s3gen.to('cpu')
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+        # Ensure T3 is on the correct device for inference.
+        # This is safe to do here because s3gen may have just been offloaded.
+        if self.t3.device != self.device:
+            self.t3.to(self.device)
+
         # T3 inference in mini-batches
         all_speech_tokens_sorted = []
         all_error_flags_sorted = []
@@ -316,7 +352,7 @@ class ChatterboxTTS:
 
                 if cfg_weight > 0.0:
                     text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
-   
+
                 speech_tokens_batch, error_flags = self.t3.inference(
                     t3_cond=t3_cond_for_inference,
                     text_tokens=text_tokens,
@@ -332,6 +368,7 @@ class ChatterboxTTS:
                 all_speech_tokens_sorted.extend(speech_tokens_batch)
                 all_error_flags_sorted.extend(error_flags)
 
+        # Restore original order of results
         results_sorted = []
         for i, item in enumerate(tokenized_items):
             results_sorted.append({
@@ -343,9 +380,18 @@ class ChatterboxTTS:
         speech_tokens_batch_ordered = [r['speech_tokens'] for r in results_sorted]
         error_flags_ordered = [r['error_flag'] for r in results_sorted]
 
+        # Offload T3 if requested, to free up VRAM for s3gen.
+        if offload_t3 and self.device.type != 'cpu':
+            self.t3.to('cpu')
+        # Load s3gen back to GPU if it was offloaded
+        if self.s3gen.device != self.device:
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+            self.s3gen.to(self.device)
+
         # Vocode speech tokens to audio
+        wavs = []
         with torch.inference_mode():
-            wavs = []
             for speech_tokens, error_flag in zip(speech_tokens_batch_ordered, error_flags_ordered):
                 if not skip_error_check and error_flag:
                     wavs.append(None) # Append None for error cases
