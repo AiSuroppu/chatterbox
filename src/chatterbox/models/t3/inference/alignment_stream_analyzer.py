@@ -304,7 +304,7 @@ class AlignmentStreamAnalyzer:
     # The max number of consecutive discontinuities allowed at the beginning of the text.
     DISCONTINUITY_THRESHOLD_START = 100
     # The max number of consecutive discontinuities allowed at the very end of the text.
-    DISCONTINUITY_THRESHOLD_END = 5
+    DISCONTINUITY_THRESHOLD_END = 15
     # Controls the steepness of the sigmoid transition for the dynamic threshold between start and end.
     DISCONTINUITY_SIGMOID_STEEPNESS = 10.0
 
